@@ -1,7 +1,13 @@
 /**
- * Weather API - Madrid
+ * Weather API
  * GET /api/weather
  * Uses Open-Meteo (free, no API key)
+ *
+ * Config:
+ * - WEATHER_CITY (optional display/geocoding label)
+ * - WEATHER_LAT and WEATHER_LON (optional explicit coordinates)
+ * - WEATHER_TZ (optional IANA timezone; defaults to Open-Meteo auto)
+ * - NEXT_PUBLIC_AGENT_LOCATION (fallback geocoding label)
  */
 import { NextResponse } from 'next/server';
 
@@ -33,6 +39,81 @@ const WMO_CODES: Record<number, { label: string; emoji: string }> = {
   99: { label: "Thunderstorm with heavy hail", emoji: "⛈️" },
 };
 
+interface WeatherLocation {
+  city: string;
+  latitude: number;
+  longitude: number;
+  timezone: string;
+}
+
+interface GeocodingResult {
+  name: string;
+  latitude: number;
+  longitude: number;
+  timezone?: string;
+  country_code?: string;
+}
+
+function envValue(name: string) {
+  const value = process.env[name]?.trim();
+  return value || undefined;
+}
+
+async function resolveWeatherLocation(): Promise<WeatherLocation> {
+  const city = envValue("WEATHER_CITY");
+  const latitude = Number.parseFloat(envValue("WEATHER_LAT") || "");
+  const longitude = Number.parseFloat(envValue("WEATHER_LON") || "");
+  const timezone = envValue("WEATHER_TZ");
+
+  if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+    return {
+      city: city || envValue("NEXT_PUBLIC_AGENT_LOCATION") || `${latitude}, ${longitude}`,
+      latitude,
+      longitude,
+      timezone: timezone || "auto",
+    };
+  }
+
+  if (envValue("WEATHER_LAT") || envValue("WEATHER_LON")) {
+    throw new Error("Invalid weather location config (WEATHER_LAT/WEATHER_LON)");
+  }
+
+  const locationName = city || envValue("NEXT_PUBLIC_AGENT_LOCATION");
+
+  if (!locationName) {
+    throw new Error("Weather location is not configured");
+  }
+
+  const params = new URLSearchParams({
+    name: locationName,
+    count: "1",
+    language: "en",
+    format: "json",
+  });
+
+  const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?${params.toString()}`, {
+    next: { revalidate: 24 * 60 * 60 },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Weather location lookup failed (${res.status})`);
+  }
+
+  const json = (await res.json()) as { results?: GeocodingResult[] };
+  const match = json.results?.[0];
+
+  if (!match || !Number.isFinite(match.latitude) || !Number.isFinite(match.longitude)) {
+    throw new Error(`Weather location not found: ${locationName}`);
+  }
+
+  return {
+    city: city || [match.name, match.country_code].filter(Boolean).join(", "),
+    latitude: match.latitude,
+    longitude: match.longitude,
+    timezone: timezone || match.timezone || "auto",
+  };
+}
+
 export async function GET() {
   // Return cache if valid
   if (cache && Date.now() - cache.ts < CACHE_DURATION) {
@@ -40,10 +121,21 @@ export async function GET() {
   }
 
   try {
-    // Madrid coordinates: 40.4168° N, 3.7038° W
-    const url = 'https://api.open-meteo.com/v1/forecast?latitude=40.4168&longitude=-3.7038&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=Europe%2FMadrid&forecast_days=3';
+    const location = await resolveWeatherLocation();
+    const params = new URLSearchParams({
+      latitude: String(location.latitude),
+      longitude: String(location.longitude),
+      current: "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,precipitation",
+      daily: "temperature_2m_max,temperature_2m_min,weather_code",
+      timezone: location.timezone,
+      forecast_days: "3",
+    });
 
-    const res = await fetch(url, { next: { revalidate: 600 } });
+    const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params.toString()}`, { next: { revalidate: 600 } });
+    if (!res.ok) {
+      throw new Error(`Weather forecast lookup failed (${res.status})`);
+    }
+
     const json = await res.json();
 
     const current = json.current;
@@ -52,7 +144,7 @@ export async function GET() {
     const wmo = WMO_CODES[current.weather_code] || { label: "Unknown", emoji: "🌡️" };
 
     const data = {
-      city: "Madrid",
+      city: location.city,
       temp: Math.round(current.temperature_2m),
       feels_like: Math.round(current.apparent_temperature),
       humidity: current.relative_humidity_2m,
